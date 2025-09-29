@@ -1,3 +1,4 @@
+# Install "pip3 pyAesCrypt -user" before running this script
 import pyAesCrypt
 import sys
 import os
