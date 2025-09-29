@@ -2,7 +2,7 @@ import pyAesCrypt
 import sys
 import os
 
-input_file = "xxx"
+input_file = "xxx" # Change this for the name of the file
 output_file = "decrypted_backup.zip"
 buffer_size = 64 * 1024
 wordlist_path = "/usr/share/wordlists/rockyou.txt"  # Change this if you have a different wordlist
