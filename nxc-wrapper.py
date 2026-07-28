@@ -20,6 +20,32 @@ from pathlib import Path
 DOWN, OPEN, AUTH_FAIL, AUTH_OK, PWNED = "DOWN", "OPEN", "AUTH_FAIL", "AUTH_OK", "PWNED"
 RANK = {DOWN: 0, OPEN: 1, AUTH_FAIL: 2, AUTH_OK: 3, PWNED: 4}
 OFF, HDR, DIM = "\033[0m", "\033[1;36m", "\033[90m"
+GREEN, RED, YELLOW, CYAN = "\033[1;32m", "\033[1;31m", "\033[33m", "\033[36m"
+PAINT = {PWNED: RED, AUTH_OK: GREEN, AUTH_FAIL: YELLOW, OPEN: CYAN, DOWN: DIM}
+USE_COLOR = True
+
+
+def c(code, text):
+    return f"{code}{text}{OFF}" if USE_COLOR else text
+
+
+def paint_line(line):
+    """[+] podswietlone, Pwn3d! na czerwono, porazki wyszarzone, reszta zwykla."""
+    if "Pwn3d!" in line:
+        return c(RED, line)
+    if "[+]" in line:
+        return c(GREEN, line)
+    if "[-]" in line:
+        return c(DIM, line)
+    if "[!]" in line:
+        return c(YELLOW, line)
+    return line
+
+
+def paint_report(txt):
+    for st in (PWNED, AUTH_OK, AUTH_FAIL, OPEN, DOWN):
+        txt = re.sub(rf"\b{st}\b", lambda m, s=st: c(PAINT[s], m.group()), txt)
+    return txt
 
 PROTOCOLS = ["smb", "ldap", "mssql", "winrm", "ssh", "rdp"]
 
@@ -101,7 +127,8 @@ def parse_args():
     p.add_argument("-p", "--password", default="", help="haslo albo plik z haslami")
     p.add_argument("-H", "--hash", default="", help="NT hash albo LM:NT")
     p.add_argument("-d", "--domain", default="")
-    p.add_argument("--dc-ip", default="", help="dns-server dla BloodHound (default: target)")
+    p.add_argument("--dc", default="", help="adres DC - checki LDAP leca tylko tu")
+    p.add_argument("--dc-ip", default="", help="dns-server dla BloodHound (default: --dc)")
     p.add_argument("-k", "--kerberos", action="store_true", help="auth Kerberos")
     p.add_argument("--kcache", action="store_true", help="uzyj KRB5CCNAME (--use-kcache)")
     p.add_argument("--kdchost", default="", help="FQDN KDC")
@@ -113,6 +140,7 @@ def parse_args():
     p.add_argument("--skip", default="", help="pomin checki po id, po przecinku")
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--nxc", default="nxc")
+    p.add_argument("--no-color", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="tylko wypisz komendy")
     return p.parse_args()
 
@@ -147,7 +175,8 @@ def build_auth(a, mode):
 # ---------------------------------------------------------------- runner
 def run(a, outdir, chk, results):
     fmt = {"out": str(outdir), "dc": a.dc_ip}
-    cmd = [a.nxc, chk.proto, a.target] + build_auth(a, chk.auth) + \
+    target = a.dc if (chk.proto == "ldap" and a.dc) else a.target
+    cmd = [a.nxc, chk.proto, target] + build_auth(a, chk.auth) + \
           [x.format(**fmt) for x in chk.args]
 
     if a.dry_run:
@@ -165,7 +194,10 @@ def run(a, outdir, chk, results):
         sys.exit(f"nie znalazlem '{a.nxc}' w PATH")
 
     out = ANSI.sub("", out)
-    print(out.rstrip() or "  (brak odpowiedzi)")
+    if out.strip():
+        print("\n".join(paint_line(l) for l in out.rstrip().splitlines()))
+    else:
+        print(c(DIM, "  (brak odpowiedzi)"))
     (outdir / f"{chk.id}.log").write_text(f"# $ {' '.join(cmd)}\n\n{out}")
     results[chk.id] = out
     return out
@@ -262,9 +294,12 @@ def report(a, outdir, matrix, results):
 
 # ---------------------------------------------------------------- main
 def main():
+    global USE_COLOR
     a = parse_args()
+    USE_COLOR = (not a.no_color and sys.stdout.isatty()
+                 and not os.environ.get("NO_COLOR"))
     if not a.dc_ip:
-        a.dc_ip = a.target
+        a.dc_ip = a.dc or a.target
     if a.kcache and not os.environ.get("KRB5CCNAME"):
         print("[!] --kcache a KRB5CCNAME nie ustawione")
 
@@ -311,7 +346,7 @@ def main():
 
     if a.dry_run:
         return
-    print(f"\n{report(a, outdir, matrix, results)}")
+    print("\n" + paint_report(report(a, outdir, matrix, results)))
     print(f"logi -> {outdir}")
 
 
