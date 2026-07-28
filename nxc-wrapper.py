@@ -211,6 +211,18 @@ def build_auth(a, mode):
     return args
 
 
+def is_range(t):
+    """Czy cel to zasieg/lista, a nie pojedynczy host."""
+    return "/" in t or "-" in t.split(".")[-1] or Path(t).is_file()
+
+
+def skip_reason(a, chk):
+    """LDAP na cala podsiec = pewne zawieszenie. Wymagamy --dc."""
+    if chk.proto == "ldap" and not a.dc and is_range(a.target):
+        return "cel to zasieg - wskaz DC przez --dc, inaczej LDAP wisi na 256 hostach"
+    return None
+
+
 def preflight(a):
     """Kombinacje, ktore ciche nie zadzialaja - lepiej wiedziec przed skanem."""
     w = []
@@ -234,13 +246,21 @@ def preflight(a):
 
 
 def adopt_banner(a, text):
-    """Z bannera SMB dociaga domene i FQDN, jesli user ich nie podal."""
-    m = BANNER.search(text)
-    if not m:
-        return
-    name, dom = m.group("name"), m.group("domain")
-    fqdn = f"{name}.{dom}" if "." in dom else name
+    """Z bannerow SMB dociaga domene i FQDN - ale tylko gdy domena jest JEDNA."""
+    found = {}
+    for m in BANNER.finditer(text):
+        found.setdefault(m.group("domain"), m.group("name"))
 
+    if len(found) > 1:
+        print(c(YELLOW, f"  [!] {len(found)} roznych domen w zasiegu: "
+                        f"{', '.join(sorted(found))}"))
+        print(c(YELLOW, "      nie ustawiam -d ani --dc automatycznie - wybierz cel sam"))
+        return
+    if not found:
+        return
+
+    dom, name = next(iter(found.items()))
+    fqdn = f"{name}.{dom}" if "." in dom else name
     if not a.domain and not a.local and "." in dom:
         a.domain = dom
         print(c(CYAN, f"  [i] wykryta domena: {dom}"))
@@ -251,6 +271,17 @@ def adopt_banner(a, text):
     if not a.dns_server and a.bh and IP_RE.match(a.target):
         a.dns_server = a.target
         print(c(CYAN, f"  [i] --dns-server ustawiony na {a.target}"))
+
+
+def suggest_next(a, matrix):
+    """Po sweepie: pokaz gdzie creds weszly i podaj gotowa komende."""
+    wins = sorted({h for (h, pr), st in matrix.items()
+                   if pr == "smb" and st in (AUTH_OK, PWNED)})
+    if not wins or not is_range(a.target):
+        return
+    print(c(GREEN, f"\n[+] creds dzialaja na: {', '.join(wins)}"))
+    print(c(DIM, f"    dalej: {sys.argv[0]} -t {','.join(wins)} "
+                 f"-u {a.user} -p '<haslo>' --dc <IP DC>\n"))
 
 
 # ---------------------------------------------------------------- runner
@@ -288,12 +319,28 @@ def run(a, outdir, chk, results, meta):
     # watchdog: dziala nawet gdy nxc wisi nie wypisujac nic
     timer = threading.Timer(a.timeout, kill)
     timer.start()
+
+    done, last_out = threading.Event(), [time.monotonic()]
+
+    def heartbeat():
+        """Zeby nie wygladalo na zawieszone, gdy nxc dlugo milczy."""
+        while not done.wait(15):
+            quiet = time.monotonic() - last_out[0]
+            if quiet >= 15:
+                print(c(DIM, f"  ... cisza od {quiet:.0f}s, "
+                             f"lacznie {time.monotonic() - t0:.0f}s "
+                             f"z limitu {a.timeout}s"))
+
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
     try:
         for line in proc.stdout:                 # czytamy na biezaco
             line = ANSI.sub("", line.rstrip())
             lines.append(line)
+            last_out[0] = time.monotonic()
             print(paint_line(line))
     finally:
+        done.set()
         timer.cancel()
         proc.wait()
 
@@ -450,6 +497,9 @@ def main():
     for chk in [c for c in CHECKS if c.when == "always"]:
         if chk.id in skip or (chk.auth != "null" and not have_creds):
             continue
+        if (why := skip_reason(a, chk)):
+            print(c(YELLOW, f"[!] pomijam {chk.id}: {why}"))
+            continue
         out = run(a, outdir, chk, results, meta)
         update_matrix(matrix, out)
         if chk.id == "probe-smb":
@@ -459,6 +509,9 @@ def main():
     if have_creds:
         for chk in [c for c in CHECKS if c.when == "auth"]:
             if chk.id in skip:
+                continue
+            if (why := skip_reason(a, chk)):
+                print(c(YELLOW, f"[!] pomijam {chk.id}: {why}"))
                 continue
             st = status_of(matrix, chk.proto)
             if not a.dry_run and RANK[st] < RANK[AUTH_OK]:
@@ -480,6 +533,7 @@ def main():
 
     if a.dry_run:
         return
+    suggest_next(a, matrix)
     print("\n" + paint_report(report(a, outdir, matrix, results, meta)))
     print(f"logi -> {outdir}")
 
