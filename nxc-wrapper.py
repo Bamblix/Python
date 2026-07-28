@@ -10,8 +10,11 @@
 import argparse
 import os
 import re
+import signal
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +59,10 @@ LINE = re.compile(
     r"\[(?P<mark>[-+*!])\]\s*(?P<msg>.*)$"
 )
 # ta sama linia ALE bez markera = wiersz z danymi (userzy, share'y, hashe)
+# (name:DC01) (domain:corp.local) - stad bierzemy FQDN i domene
+BANNER = re.compile(r"\(name:(?P<name>[^)]*)\)\s*\(domain:(?P<domain>[^)]*)\)")
+IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
 DATA_LINE = re.compile(r"^[A-Z0-9]+\s+\S+\s+\d+\s+\S+\s+(?P<msg>.+)$")
 
 
@@ -100,9 +107,12 @@ CHECKS = [
           ["--bloodhound", "--collection", "All", "--dns-server", "{dc}"],
           when="opt", label="BloodHound"),
     Check("rdp-screenshot", "rdp", ["--screenshot"], when="opt", label="RDP screenshot"),
+    Check("gen-hosts", "smb", ["--generate-hosts-file", "{out}/hosts"],
+          when="opt", label="generuj /etc/hosts"),
 ]
 
-OPTIONAL = {"ldap-bloodhound": "bh", "rdp-screenshot": "screenshot"}
+OPTIONAL = {"ldap-bloodhound": "bh", "rdp-screenshot": "screenshot",
+            "gen-hosts": "gen_hosts"}
 
 # co wyciagnac do sekcji FINDINGS: check_id -> regex dopasowywany do linii
 FINDINGS = {
@@ -140,9 +150,38 @@ def parse_args():
     p.add_argument("--skip", default="", help="pomin checki po id, po przecinku")
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--nxc", default="nxc")
+    p.add_argument("--gen-hosts", action="store_true",
+                   help="nxc --generate-hosts-file (wpisy do /etc/hosts)")
+    p.add_argument("--debug", action="store_true", help="nxc --debug")
+    p.add_argument("--verbose", action="store_true", help="nxc --verbose")
+    p.add_argument("--nxc-timeout", type=int, default=30, help="nxc --timeout (na watek)")
+    p.add_argument("--threads", type=int, default=0, help="nxc --threads")
+    p.add_argument("--jitter", default="", help="nxc --jitter")
+    p.add_argument("--dns-server", default="", help="nxc --dns-server")
+    p.add_argument("--dns-timeout", type=int, default=0, help="nxc --dns-timeout")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="tylko wypisz komendy")
     return p.parse_args()
+
+
+def nxc_globals(a):
+    """Flagi nxc doklejane do kazdej komendy."""
+    g = ["--no-progress"]                      # pasek postepu smieci w logach
+    if a.debug:
+        g.append("--debug")
+    elif a.verbose:
+        g.append("--verbose")
+    if a.nxc_timeout:
+        g += ["--timeout", str(a.nxc_timeout)]  # max czas na watek
+    if a.threads:
+        g += ["--threads", str(a.threads)]
+    if a.jitter:
+        g += ["--jitter", str(a.jitter)]
+    if a.dns_server:
+        g += ["--dns-server", a.dns_server]
+    if a.dns_timeout:
+        g += ["--dns-timeout", str(a.dns_timeout)]
+    return g
 
 
 def is_list(value):
@@ -172,12 +211,54 @@ def build_auth(a, mode):
     return args
 
 
+def preflight(a):
+    """Kombinacje, ktore ciche nie zadzialaja - lepiej wiedziec przed skanem."""
+    w = []
+    bare = a.target.split("/")[0]
+    if a.kerberos or a.kcache:
+        if IP_RE.match(bare) and not a.dc:
+            w.append("Kerberos po IP nie zadziala - SPN buduje sie z nazwy. "
+                     "Daj --dc dc01.corp.local i wpis w /etc/hosts")
+        if not a.kdchost:
+            w.append("Kerberos bez --kdchost: nxc szuka KDC przez DNS, latwo o timeout")
+        if not a.domain:
+            w.append("Kerberos bez -d: realm nie bedzie znany")
+    if a.domain and a.local:
+        w.append("-d i --local sie wykluczaja w nxc, zostaw jedno")
+    if a.bh and not a.dns_server:
+        w.append("--bh bez --dns-server: BloodHound nie rozwiaze hostow domenowych "
+                 "(daj --dns-server <IP DC>)")
+    if a.dc and IP_RE.match(a.dc) and (a.kerberos or a.kcache):
+        w.append("--dc po IP przy Kerberosie - powinien byc FQDN")
+    return w
+
+
+def adopt_banner(a, text):
+    """Z bannera SMB dociaga domene i FQDN, jesli user ich nie podal."""
+    m = BANNER.search(text)
+    if not m:
+        return
+    name, dom = m.group("name"), m.group("domain")
+    fqdn = f"{name}.{dom}" if "." in dom else name
+
+    if not a.domain and not a.local and "." in dom:
+        a.domain = dom
+        print(c(CYAN, f"  [i] wykryta domena: {dom}"))
+    if not a.dc and (a.kerberos or a.kcache) and "." in dom:
+        a.dc = fqdn
+        print(c(CYAN, f"  [i] LDAP/Kerberos kieruje na {fqdn} "
+                      f"(dodaj do /etc/hosts: {a.target} {fqdn} {name})"))
+    if not a.dns_server and a.bh and IP_RE.match(a.target):
+        a.dns_server = a.target
+        print(c(CYAN, f"  [i] --dns-server ustawiony na {a.target}"))
+
+
 # ---------------------------------------------------------------- runner
-def run(a, outdir, chk, results):
+def run(a, outdir, chk, results, meta):
     fmt = {"out": str(outdir), "dc": a.dc_ip}
     target = a.dc if (chk.proto == "ldap" and a.dc) else a.target
     cmd = [a.nxc, chk.proto, target] + build_auth(a, chk.auth) + \
-          [x.format(**fmt) for x in chk.args]
+          [x.format(**fmt) for x in chk.args] + nxc_globals(a)
 
     if a.dry_run:
         print(" ".join(cmd))
@@ -185,20 +266,51 @@ def run(a, outdir, chk, results):
         return ""
 
     print(f"{HDR}[*] {chk.label or chk.id}{OFF}")
+    t0 = time.monotonic()
+    lines, killed = [], False
+
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
-        out = r.stdout + r.stderr
-    except subprocess.TimeoutExpired:
-        out = f"[!] TIMEOUT po {a.timeout}s"
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                start_new_session=True)   # wlasna grupa procesow
     except FileNotFoundError:
         sys.exit(f"nie znalazlem '{a.nxc}' w PATH")
 
-    out = ANSI.sub("", out)
-    if out.strip():
-        print("\n".join(paint_line(l) for l in out.rstrip().splitlines()))
-    else:
+    def kill():
+        """Zabija cala grupe - inaczej dzieci nxc trzymaja pipe i czytanie wisi."""
+        nonlocal killed
+        killed = True
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    # watchdog: dziala nawet gdy nxc wisi nie wypisujac nic
+    timer = threading.Timer(a.timeout, kill)
+    timer.start()
+    try:
+        for line in proc.stdout:                 # czytamy na biezaco
+            line = ANSI.sub("", line.rstrip())
+            lines.append(line)
+            print(paint_line(line))
+    finally:
+        timer.cancel()
+        proc.wait()
+
+    elapsed = time.monotonic() - t0
+    out = "\n".join(lines)
+
+    if killed:
+        last = lines[-1] if lines else "(nic nie zdazylo wyjsc)"
+        print(c(YELLOW, f"  [!] TIMEOUT po {elapsed:.0f}s, ostatnia linia: {last}"))
+        out += f"\n[!] ZABITE PO TIMEOUCIE {elapsed:.0f}s"
+    elif not lines:
         print(c(DIM, "  (brak odpowiedzi)"))
-    (outdir / f"{chk.id}.log").write_text(f"# $ {' '.join(cmd)}\n\n{out}")
+
+    print(c(DIM, f"  ({elapsed:.1f}s)"))
+    meta[chk.id] = {"elapsed": elapsed, "timeout": killed,
+                    "last": lines[-1] if lines else "", "cmd": " ".join(cmd)}
+    (outdir / f"{chk.id}.log").write_text(f"# $ {' '.join(cmd)}\n# {elapsed:.1f}s\n\n{out}\n")
     results[chk.id] = out
     return out
 
@@ -239,7 +351,7 @@ def status_of(matrix, proto):
 
 
 # ---------------------------------------------------------------- raport
-def report(a, outdir, matrix, results):
+def report(a, outdir, matrix, results, meta):
     out = [f"=== nxsweep {a.target} ({datetime.now():%Y-%m-%d %H:%M}) ===", ""]
 
     hosts = sorted({h for (h, _) in matrix})
@@ -272,6 +384,21 @@ def report(a, outdir, matrix, results):
             out.append("")
     if not found:
         out.append("(nic)\n")
+
+    timeouts = [(k, m) for k, m in meta.items() if m["timeout"]]
+    if timeouts:
+        out.append("--- TIMEOUTY ---")
+        for k, m in timeouts:
+            out.append(f"  {k}  ({m['elapsed']:.0f}s)")
+            out.append(f"    ostatnia linia: {m['last'] or '(brak outputu)'}")
+            out.append(f"    powtorz: {m['cmd']} --debug")
+        out.append("")
+
+    slow = sorted(meta.items(), key=lambda kv: -kv[1]["elapsed"])[:5]
+    if slow:
+        out.append("--- NAJWOLNIEJSZE ---")
+        out += [f"  {k:<18} {m['elapsed']:6.1f}s" for k, m in slow]
+        out.append("")
 
     out.append("--- HASHE ---")
     any_hash = False
@@ -308,18 +435,25 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     skip = {s.strip() for s in a.skip.split(",") if s.strip()}
 
-    results, matrix = {}, {}
+    results, matrix, meta = {}, {}, {}
     have_creds = bool(a.user)
 
     print(f"target : {a.target}\nuser   : {a.user or '<brak>'}\n"
           f"auth   : {'hash' if a.hash else 'kerberos' if a.kerberos else 'haslo'}\n"
           f"out    : {outdir}\n")
 
+    for wmsg in preflight(a):
+        print(c(YELLOW, f"[!] {wmsg}"))
+    print()
+
     # faza 1 - probe
     for chk in [c for c in CHECKS if c.when == "always"]:
         if chk.id in skip or (chk.auth != "null" and not have_creds):
             continue
-        update_matrix(matrix, run(a, outdir, chk, results))
+        out = run(a, outdir, chk, results, meta)
+        update_matrix(matrix, out)
+        if chk.id == "probe-smb":
+            adopt_banner(a, out)      # domena/FQDN znane dopiero po tym probie
 
     # faza 2 - enum tylko tam gdzie auth dziala
     if have_creds:
@@ -330,23 +464,23 @@ def main():
             if not a.dry_run and RANK[st] < RANK[AUTH_OK]:
                 print(f"{DIM}[-] pomijam {chk.id}: {chk.proto.upper()}={st}{OFF}")
                 continue
-            update_matrix(matrix, run(a, outdir, chk, results))
+            update_matrix(matrix, run(a, outdir, chk, results, meta))
 
     # faza 3 - loot
     if a.loot and (a.dry_run or status_of(matrix, "smb") == PWNED):
         for chk in [c for c in CHECKS if c.when == "pwned"]:
             if chk.id not in skip:
-                update_matrix(matrix, run(a, outdir, chk, results))
+                update_matrix(matrix, run(a, outdir, chk, results, meta))
 
     # opcjonalne
     for chk in [c for c in CHECKS if c.when == "opt"]:
         if chk.id in skip or not getattr(a, OPTIONAL[chk.id]):
             continue
-        update_matrix(matrix, run(a, outdir, chk, results))
+        update_matrix(matrix, run(a, outdir, chk, results, meta))
 
     if a.dry_run:
         return
-    print("\n" + paint_report(report(a, outdir, matrix, results)))
+    print("\n" + paint_report(report(a, outdir, matrix, results, meta)))
     print(f"logi -> {outdir}")
 
 
