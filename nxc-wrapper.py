@@ -8,6 +8,8 @@
   ./nxsweep.py -t 10.10.10.10 -u jdoe -p 'x' --dry-run
 """
 import argparse
+import asyncio
+import ipaddress
 import os
 import re
 import signal
@@ -50,7 +52,11 @@ def paint_report(txt):
         txt = re.sub(rf"\b{st}\b", lambda m, s=st: c(PAINT[s], m.group()), txt)
     return txt
 
-PROTOCOLS = ["smb", "ldap", "mssql", "winrm", "ssh", "rdp"]
+PROTOCOLS = ["smb", "ldap", "mssql", "winrm", "wmi", "rdp", "ssh", "ftp", "nfs", "vnc"]
+PORTS = {"smb": 445, "ldap": 389, "mssql": 1433, "winrm": 5985, "wmi": 135,
+         "rdp": 3389, "ssh": 22, "ftp": 21, "nfs": 2049, "vnc": 5900}
+
+FAILCODE = re.compile(r"(STATUS_[A-Z_]+|KDC_ERR_[A-Z_]+|Login failed[^,]*)")
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # SMB   10.10.10.5   445   DC01   [+] corp.local\user:pass (Pwn3d!)
@@ -150,6 +156,14 @@ def parse_args():
     p.add_argument("--skip", default="", help="pomin checki po id, po przecinku")
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--nxc", default="nxc")
+    p.add_argument("--no-local", action="store_true",
+                   help="nie testuj trybu --local-auth")
+    p.add_argument("--no-portscan", action="store_true",
+                   help="nie skanuj portow, wal nxc we wszystko (wolne)")
+    p.add_argument("--port-timeout", type=float, default=1.0, help="timeout TCP connect")
+    p.add_argument("--port-conc", type=int, default=500, help="rownoleglosc skanu portow")
+    p.add_argument("--raw", action="store_true",
+                   help="pelny output nxc takze w fazie probe")
     p.add_argument("--gen-hosts", action="store_true",
                    help="nxc --generate-hosts-file (wpisy do /etc/hosts)")
     p.add_argument("--debug", action="store_true", help="nxc --debug")
@@ -195,8 +209,8 @@ def build_auth(a, mode):
 
     args = ["-u", a.user]
     args += ["-H", a.hash] if a.hash else ["-p", a.password]
-    if a.domain:
-        args += ["-d", a.domain]
+    if a.domain and not (a.local or mode == "local"):
+        args += ["-d", a.domain]        # nxc wyklucza -d z --local-auth
     if a.kerberos:
         args.append("-k")
     if a.kcache:
@@ -211,6 +225,63 @@ def build_auth(a, mode):
     return args
 
 
+def expand_targets(t):
+    """CIDR / lista po przecinku / plik / pojedynczy host -> lista hostow."""
+    out = []
+    for part in (x.strip() for x in t.split(",") if x.strip()):
+        if Path(part).is_file():
+            out += [l.strip() for l in Path(part).read_text().splitlines()
+                    if l.strip() and not l.startswith("#")]
+        elif "/" in part:
+            out += [str(ip) for ip in ipaddress.ip_network(part, strict=False).hosts()]
+        else:
+            out.append(part)
+    return out
+
+
+async def _probe(host, port, timeout, sem):
+    async with sem:
+        try:
+            _, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+            w.close()
+            return host, port
+        except Exception:
+            return None
+
+
+async def _scan(hosts, ports, timeout, conc):
+    sem = asyncio.Semaphore(conc)
+    tasks = [_probe(h, p, timeout, sem) for h in hosts for p in ports]
+    return [r for r in await asyncio.gather(*tasks) if r]
+
+
+def portscan(a, hosts):
+    """Goly TCP connect. Zwraca {protokol: [hosty z otwartym portem]}."""
+    ports = sorted({PORTS[p] for p in PORTS})
+    t0 = time.monotonic()
+    print(c(HDR, f"[*] skan portow: {len(hosts)} hostow x {len(ports)} portow "
+                 f"= {len(hosts) * len(ports)} prob"))
+    try:
+        open_pairs = asyncio.run(_scan(hosts, ports, a.port_timeout, a.port_conc))
+    except KeyboardInterrupt:
+        sys.exit("przerwane")
+
+    by_port = {}
+    for h, prt in open_pairs:
+        by_port.setdefault(prt, []).append(h)
+
+    result = {}
+    for proto, prt in PORTS.items():
+        if by_port.get(prt):
+            result[proto] = sorted(by_port[prt], key=lambda x: x.split("."))
+    print(c(DIM, f"    {time.monotonic() - t0:.1f}s, otwartych: {len(open_pairs)}"))
+    for proto in PROTOCOLS:
+        hs = result.get(proto, [])
+        tag = c(GREEN, f"{len(hs):>3} host(ow)") if hs else c(DIM, "  0")
+        print(f"    {proto.upper():<6} :{PORTS[proto]:<5} {tag}")
+    return result
+
+
 def is_range(t):
     """Czy cel to zasieg/lista, a nie pojedynczy host."""
     return "/" in t or "-" in t.split(".")[-1] or Path(t).is_file()
@@ -218,6 +289,9 @@ def is_range(t):
 
 def skip_reason(a, chk):
     """LDAP na cala podsiec = pewne zawieszenie. Wymagamy --dc."""
+    if (a.proto_targets and chk.proto not in a.proto_targets
+            and not (chk.proto == "ldap" and a.dc)):
+        return f"port {PORTS.get(chk.proto, '?')} zamkniety wszedzie"
     if chk.proto == "ldap" and not a.dc and is_range(a.target):
         return "cel to zasieg - wskaz DC przez --dc, inaczej LDAP wisi na 256 hostach"
     return None
@@ -285,9 +359,14 @@ def suggest_next(a, matrix):
 
 
 # ---------------------------------------------------------------- runner
-def run(a, outdir, chk, results, meta):
+def run(a, outdir, chk, results, meta, quiet=False):
     fmt = {"out": str(outdir), "dc": a.dc_ip}
-    target = a.dc if (chk.proto == "ldap" and a.dc) else a.target
+    if chk.proto == "ldap" and a.dc:
+        target = a.dc
+    elif chk.proto in a.proto_targets:
+        target = a.proto_targets[chk.proto]     # plik z zywymi hostami
+    else:
+        target = a.target
     cmd = [a.nxc, chk.proto, target] + build_auth(a, chk.auth) + \
           [x.format(**fmt) for x in chk.args] + nxc_globals(a)
 
@@ -296,7 +375,8 @@ def run(a, outdir, chk, results, meta):
         results[chk.id] = ""
         return ""
 
-    print(f"{HDR}[*] {chk.label or chk.id}{OFF}")
+    if not quiet:
+        print(f"{HDR}[*] {chk.label or chk.id}{OFF}")
     t0 = time.monotonic()
     lines, killed = [], False
 
@@ -338,7 +418,8 @@ def run(a, outdir, chk, results, meta):
             line = ANSI.sub("", line.rstrip())
             lines.append(line)
             last_out[0] = time.monotonic()
-            print(paint_line(line))
+            if not quiet:
+                print(paint_line(line))
     finally:
         done.set()
         timer.cancel()
@@ -349,12 +430,14 @@ def run(a, outdir, chk, results, meta):
 
     if killed:
         last = lines[-1] if lines else "(nic nie zdazylo wyjsc)"
-        print(c(YELLOW, f"  [!] TIMEOUT po {elapsed:.0f}s, ostatnia linia: {last}"))
+        if not quiet:
+            print(c(YELLOW, f"  [!] TIMEOUT po {elapsed:.0f}s, ostatnia linia: {last}"))
         out += f"\n[!] ZABITE PO TIMEOUCIE {elapsed:.0f}s"
-    elif not lines:
+    elif not lines and not quiet:
         print(c(DIM, "  (brak odpowiedzi)"))
 
-    print(c(DIM, f"  ({elapsed:.1f}s)"))
+    if not quiet:
+        print(c(DIM, f"  ({elapsed:.1f}s)"))
     meta[chk.id] = {"elapsed": elapsed, "timeout": killed,
                     "last": lines[-1] if lines else "", "cmd": " ".join(cmd)}
     (outdir / f"{chk.id}.log").write_text(f"# $ {' '.join(cmd)}\n# {elapsed:.1f}s\n\n{out}\n")
@@ -397,16 +480,137 @@ def status_of(matrix, proto):
     return best
 
 
+def probe_verdict(text, killed=False):
+    """(status, powod) dla jednego probe'a - to co idzie w jedna linie."""
+    rows = parse_lines(text)
+    if killed:
+        return DOWN, "timeout"
+    if not rows:
+        return DOWN, "brak odpowiedzi (port zamkniety lub filtrowany)"
+
+    best, why = DOWN, ""
+    for r in rows:
+        st = classify(r)
+        if RANK[st] > RANK[best]:
+            best = st
+            m = FAILCODE.search(r["msg"])
+            why = m.group(1) if m else r["msg"]
+    if best in (AUTH_OK, PWNED):
+        why = "admin" if best == PWNED else "logowanie dziala"
+    elif best == AUTH_FAIL and not why:
+        why = "creds odrzucone"
+    elif best == OPEN:
+        why = "port otwarty, brak proby auth"
+    return best, why
+
+
+def auth_summary(a, matrix, verdicts):
+    bar = "=" * 62
+    out = [bar, "PODSUMOWANIE AUTORYZACJI", bar, ""]
+    ok = [p for p in PROTOCOLS if verdicts.get(p, (DOWN,))[0] in (AUTH_OK, PWNED)]
+    bad = [p for p in PROTOCOLS if p not in ok and p in verdicts]
+    out += [f"Protokolow sprawdzonych: {len(verdicts)}",
+            f"Dziala:     {len(ok)}",
+            f"Nie dziala: {len(bad)}", ""]
+
+    if ok:
+        out.append("Dziala na:")
+        for pr in ok:
+            hosts = sorted(h for (h, q), st in matrix.items()
+                           if q == pr and st in (AUTH_OK, PWNED))
+            tag = " (ADMIN)" if verdicts[pr][0] == PWNED else ""
+            out.append(f"  - {pr.upper():<7}{tag} {', '.join(hosts)}")
+        out.append("")
+    if bad:
+        out.append("Nie dziala:")
+        for pr in bad:
+            out.append(f"  - {pr.upper():<7} {verdicts[pr][1]}")
+        out.append("")
+    out.append(bar)
+    return "\n".join(out)
+
+
+MODES = (("domain", "creds"), ("local", "local"))
+TICK, CROSS, BOLT, ARROW = "v", "x", ">>", "->"
+
+
+def ipkey(h):
+    try:
+        return (0, int(ipaddress.ip_address(h)), "")
+    except ValueError:
+        return (1, 0, h)
+
+
+def header_box(a, ntasks):
+    rows = [("Cel", a.target), ("User", a.user or "-"),
+            ("Auth", "hash" if a.hash else "kerberos" if a.kerberos else "haslo"),
+            ("Tryby", "domain + local" if not a.local else "tylko local"),
+            ("Timeout", f"{a.timeout}s/check, {a.nxc_timeout}s/watek"),
+            ("Zadan", str(ntasks)), ("Logi", str(a.outdir))]
+    w = max(len(k) for k, _ in rows)
+    line = "-" * 64
+    body = "\n".join(f"  {k:<{w}} | {v}" for k, v in rows)
+    return f"{line}\n{body}\n{line}"
+
+
+def render_hosts(hits, hostinfo):
+    """Blok per host: co przeszlo, co nie, i czego nie bylo."""
+    out = []
+    hosts = sorted({h for (h, _, _) in hits} | set(hostinfo), key=ipkey)
+    for host in hosts:
+        out.append(c(HDR, f"\n> {host}"))
+        if hostinfo.get(host):
+            out.append(c(DIM, f"  {hostinfo[host]}"))
+        out.append("")
+        silent = []
+        for pr in PROTOCOLS:
+            entries = [(mode, hits[(host, pr, mode)])
+                       for mode, _ in MODES if (host, pr, mode) in hits]
+            if not entries:
+                silent.append(pr.upper())
+                continue
+            for mode, (st, msg) in entries:
+                label = f"{pr.upper()} ({mode})"
+                if st in (AUTH_OK, PWNED):
+                    out.append(f"  {c(GREEN, TICK)} {c(GREEN, label):<28} {msg}")
+                else:
+                    out.append(f"  {c(RED, CROSS)} {c(DIM, label):<28} {c(DIM, msg)}")
+        if silent:
+            out.append(c(DIM, f"  {ARROW} brak odpowiedzi: {', '.join(silent)}"))
+    return "\n".join(out)
+
+
+def render_creds(hits):
+    """Sam wyciag tego, co dziala - to zwykle jedyne, co czytasz."""
+    wins = [(h, pr, mode, msg) for (h, pr, mode), (st, msg) in hits.items()
+            if st in (AUTH_OK, PWNED)]
+    if not wins:
+        return c(DIM, "\nBrak dzialajacych creds.")
+    wins.sort(key=lambda x: (ipkey(x[0]), PROTOCOLS.index(x[1]), x[2]))
+    line = "=" * 64
+    out = [f"\n{line}", c(GREEN, "DZIALAJACE CREDS"), line]
+    last = None
+    for host, pr, mode, msg in wins:
+        if host != last:
+            out.append(c(HDR, f"\n  {host}"))
+            last = host
+        out.append(f"    {c(GREEN, BOLT)} {f'{pr.upper()} ({mode})':<22} {msg}")
+    out.append(line)
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------- raport
 def report(a, outdir, matrix, results, meta):
     out = [f"=== nxsweep {a.target} ({datetime.now():%Y-%m-%d %H:%M}) ===", ""]
 
     hosts = sorted({h for (h, _) in matrix})
     out.append("--- MACIERZ STATUSOW ---")
-    out.append(f"{'HOST':<22}" + "".join(f"{p.upper():<11}" for p in PROTOCOLS))
+    live = [p for p in PROTOCOLS
+            if any(q == p and st != DOWN for (_, q), st in matrix.items())] or PROTOCOLS[:1]
+    out.append(f"{'HOST':<22}" + "".join(f"{p.upper():<11}" for p in live))
     for h in hosts:
         out.append(f"{h:<22}" + "".join(
-            f"{matrix.get((h, p), DOWN):<11}" for p in PROTOCOLS))
+            f"{matrix.get((h, p), DOWN):<11}" for p in live))
     out += ["",
             "DOWN=brak odpowiedzi  OPEN=port otwarty, auth nieudany/niepodjety",
             "AUTH_FAIL=creds odrzucone  AUTH_OK=logowanie dziala  PWNED=admin",
@@ -481,6 +685,7 @@ def main():
     outdir = Path(a.out or f"nxsweep-{stem}-{datetime.now():%Y%m%d-%H%M%S}")
     outdir.mkdir(parents=True, exist_ok=True)
     skip = {s.strip() for s in a.skip.split(",") if s.strip()}
+    a.outdir = outdir
 
     results, matrix, meta = {}, {}, {}
     have_creds = bool(a.user)
@@ -489,21 +694,72 @@ def main():
           f"auth   : {'hash' if a.hash else 'kerberos' if a.kerberos else 'haslo'}\n"
           f"out    : {outdir}\n")
 
+    a.proto_targets = {}
+    if not a.no_portscan and not a.dry_run:
+        hosts = expand_targets(a.target)
+        alive = portscan(a, hosts)
+        for proto, hs in alive.items():
+            f = outdir / f"targets-{proto}.txt"
+            f.write_text("\n".join(hs) + "\n")
+            a.proto_targets[proto] = str(f)
+        dead = [p for p in PROTOCOLS if p not in alive]
+        if dead:
+            print(c(DIM, f"    pomijam calkiem: {', '.join(x.upper() for x in dead)}"))
+        print()
+
     for wmsg in preflight(a):
         print(c(YELLOW, f"[!] {wmsg}"))
     print()
 
-    # faza 1 - probe
-    for chk in [c for c in CHECKS if c.when == "always"]:
+    # faza 1 - probe: kazdy protokol w trybie domenowym i lokalnym
+    live = [pr for pr in PROTOCOLS
+            if not a.proto_targets or pr in a.proto_targets
+            or (pr == "ldap" and a.dc)]
+    modes = [m for m in MODES
+             if not (a.local and m[0] == "domain") and not (a.no_local and m[0] == "local")]
+    print(header_box(a, len(live) * len(modes)))
+    print(c(HDR, "\n[*] skan autoryzacji"))
+
+    hits, hostinfo = {}, {}
+    for i, pr in enumerate(live, 1):
+        cells = []
+        for mode, authmode in modes:
+            chk = Check(f"probe-{pr}-{mode}", pr, [], auth=authmode,
+                        label=f"probe {pr.upper()} ({mode})")
+            if chk.id in skip or not have_creds:
+                continue
+            out = run(a, outdir, chk, results, meta, quiet=not a.raw)
+            update_matrix(matrix, out)
+            best = DOWN
+            for r in parse_lines(out):
+                if r["mark"] == "*":
+                    hostinfo.setdefault(r["host"], r["msg"])
+                    continue
+                st = classify(r)
+                hits[(r["host"], pr, mode)] = (st, r["msg"])
+                if RANK[st] > RANK[best]:
+                    best = st
+            cells.append((mode, best))
+            if pr == "smb" and mode == "domain":
+                adopt_banner(a, out)
+        txt = "  ".join(
+            f"{mode}: " + (c(RED, "ADMIN") if st == PWNED else c(GREEN, "OK")
+                           if st == AUTH_OK else c(DIM, "-"))
+            for mode, st in cells)
+        print(f"[*] {i}/{len(live)}: {pr.upper():<6} {txt}")
+
+    dead = [pr.upper() for pr in PROTOCOLS if pr not in live]
+    if dead:
+        print(c(DIM, f"    pominiete (port zamkniety): {', '.join(dead)}"))
+
+    print(render_hosts(hits, hostinfo))
+    print(render_creds(hits))
+    print()
+
+    for chk in [x for x in CHECKS if x.when == "always" and not x.id.startswith("probe-")]:
         if chk.id in skip or (chk.auth != "null" and not have_creds):
             continue
-        if (why := skip_reason(a, chk)):
-            print(c(YELLOW, f"[!] pomijam {chk.id}: {why}"))
-            continue
-        out = run(a, outdir, chk, results, meta)
-        update_matrix(matrix, out)
-        if chk.id == "probe-smb":
-            adopt_banner(a, out)      # domena/FQDN znane dopiero po tym probie
+        update_matrix(matrix, run(a, outdir, chk, results, meta))
 
     # faza 2 - enum tylko tam gdzie auth dziala
     if have_creds:
